@@ -15,7 +15,8 @@ I test verificano:
   T5 - ERR stale (MIN_VERSION > best disponibile)
   T6 - Read repair (convergenza dopo lettura)
   T7 - Quorum non raggiungibile
-  T8 - CAS con divergenza tra repliche
+  T8 - CAS + session consistency
+  T9 - Lettura stale SENZA garanzia vs CON garanzia (test chiave!)
 
 COME ESEGUIRE:
   python acceptance_test.py
@@ -71,6 +72,11 @@ def request(command: str, port: int = COORDINATOR_PORT) -> str:
         connection_file.write((command + "\n").encode("utf-8"))
         connection_file.flush()
         return connection_file.readline().decode("utf-8", errors="replace").strip()
+
+
+def request_to(command: str, port: int) -> str:
+    """Invia un comando a un coordinator su una porta specifica."""
+    return request(command, port=port)
 
 
 def rpc_to_replica(port: int, message: dict) -> dict | None:
@@ -317,6 +323,92 @@ def main() -> None:
         expect("GETV eta MIN_VERSION 2", "OK final version=2", "T8")
         # MIN_VERSION 1 con version attuale=2 deve comunque funzionare (2 >= 1)
         expect("GETV eta MIN_VERSION 1", "OK final version=2", "T8")
+        print()
+
+        # =================================================================
+        # T9: Lettura stale SENZA vs CON garanzia di sessione
+        # Questo e' il test piu' importante: dimostra che SENZA la
+        # garanzia di sessione (MIN_VERSION), un client puo' leggere
+        # dati vecchi. CON MIN_VERSION il sistema rifiuta correttamente.
+        #
+        # Strategia:
+        # 1. Scrivo "theta" via coordinator -> tutte le repliche hanno v=0
+        # 2. Scrivo direttamente su R0 la versione 3 (simulando avanzamento)
+        #    R1 e R2 restano a v=0 (stale)
+        # 3. PRIMA di usare il coordinator principale (che farebbe read
+        #    repair e aggiornerebbe R1!), avvio un coordinator secondario
+        #    con R=1 puntato SOLO su R1 per dimostrare la lettura stale
+        # 4. SENZA MIN_VERSION -> si legge v=0 (STALE!)
+        # 5. CON MIN_VERSION 3 -> ERR stale (il sistema protegge il client)
+        # =================================================================
+        print("-" * 60)
+        print("T9: Lettura stale SENZA vs CON garanzia (test chiave)")
+        print("-" * 60)
+
+        # Step 1: scrivo theta via coordinator (tutte le repliche: v=0)
+        expect("SET theta base_value", "OK version=0", "T9")
+
+        # Step 2: avanzo SOLO R0 direttamente alla versione 3
+        # R1 e R2 restano con version=0 (simulando una replica avanti)
+        rpc_to_replica(REPLICAS[0][1], {
+            "type": "write", "key": "theta",
+            "value": "advanced_value", "version": 3,
+        })
+        print("  [T9] Forced R0 to version=3 (R1,R2 still at version=0)")
+
+        # Step 3: avvio SUBITO un coordinator secondario con R=1, W=1
+        # che punta SOLO a R1 (che ha ancora v=0)
+        # IMPORTANTE: lo faccio PRIMA di leggere dal coordinator principale,
+        # perche' il coordinator principale farebbe read repair su R1!
+        stale_coord_port = 6450
+        stale_coord = subprocess.Popen(
+            [
+                sys.executable,
+                str(root / "coordinator.py"),
+                "--port", str(stale_coord_port),
+                "--read-quorum", "1",
+                "--write-quorum", "1",
+                "--replicas", f"{HOST}:{REPLICAS[1][1]}",  # solo R1 (stale!)
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        processes.append(stale_coord)
+        wait_for_port(stale_coord_port)
+
+        # Step 4: SENZA MIN_VERSION -> legge da R1 -> ottiene v=0 (STALE!)
+        # Questo dimostra che senza garanzia di sessione il client
+        # riceverebbe un dato vecchio rispetto a cio' che esiste su R0!
+        stale_response = request_to("GETV theta", stale_coord_port)
+        print(f"  [T9] GETV theta (NO MIN_VERSION, solo R1) -> {stale_response}")
+        if "version=0" in stale_response:
+            print("  [T9] CONFIRMED: Senza MIN_VERSION si legge dato STALE (v=0) [PASS]")
+            passed += 1
+        else:
+            print(f"  [T9] Expected stale read with version=0 [FAIL]")
+            failed += 1
+
+        # Step 5: CON MIN_VERSION 3 -> il coordinator rifiuta perche'
+        # R1 ha solo v=0 che e' < 3 -> ERR stale
+        # Questo e' il cuore della session consistency: il client aveva
+        # letto v=3 dal coordinator principale, quindi sa che v=0 e' stale
+        guarded_response = request_to("GETV theta MIN_VERSION 3", stale_coord_port)
+        print(f"  [T9] GETV theta MIN_VERSION 3 (solo R1) -> {guarded_response}")
+        if guarded_response.startswith("ERR stale"):
+            print("  [T9] CONFIRMED: Con MIN_VERSION il dato stale viene RIFIUTATO [PASS]")
+            passed += 1
+        else:
+            print(f"  [T9] Expected ERR stale [FAIL]")
+            failed += 1
+
+        # Step 6: ora leggo dal coordinator principale per confronto
+        # (questo fara' anche read repair su R1 e R2)
+        expect("GETV theta", "OK advanced_value version=3", "T9")
+
+        print()
+        print("  >>> CONCLUSIONE T9: MIN_VERSION protegge il client da letture stale <<<")
+        print("  >>> Senza questa garanzia, il client avrebbe letto version=0       <<<")
+        print("  >>> Con MIN_VERSION=3, il sistema rifiuta e segnala ERR stale       <<<")
         print()
 
         # =================================================================
