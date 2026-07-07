@@ -97,10 +97,19 @@ e' esattamente `expected_version`. La nuova versione sara' `expected_version + 1
 ### GET
 
 ```
-GET <key> [MIN_VERSION <v>]
+GET <key>
 ```
 
-Come `GETV` ma la risposta non include la versione. Supporta `MIN_VERSION`.
+Lettura leggera: interroga solo R repliche (senza read repair) e restituisce
+valore e versione.
+
+**Non supporta `MIN_VERSION`.** Per letture con garanzia di session consistency,
+usare `GETV`.
+
+**Risposta:**
+- `OK <value> version=<v>` — lettura riuscita
+- `NOT_FOUND` — chiave inesistente
+- `ERR read quorum not reached responses=<n>` — quorum non raggiunto
 
 ---
 
