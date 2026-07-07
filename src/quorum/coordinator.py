@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Coordinator con Quorum e Session Consistency (MIN_VERSION).
 
@@ -288,13 +287,23 @@ class QuorumCoordinator:
 
     def _handle_get(self, argument_blob: str) -> tuple[str, bool]:
         """
-        GET <key> [MIN_VERSION <v>]
+        GET <key>
 
-        Come GETV ma restituisce solo il valore senza la versione nella risposta.
-        Supporta comunque MIN_VERSION per session consistency.
+        Lettura leggera: legge solo da R repliche (senza read repair).
+        Restituisce valore e versione. Non supporta MIN_VERSION.
         """
-        # Riuso la logica di GETV
-        return self._handle_getv(argument_blob, show_version=False)
+        key = argument_blob.strip()
+        if not key:
+            return "ERR usage: GET <key>", False
+
+        reads = self._collect_reads(key, limit=self._read_quorum)
+        if len(reads) < self._read_quorum:
+            return f"ERR read quorum not reached responses={len(reads)}", False
+
+        version, value = self._highest_version(reads)
+        if version < 0 or value is None:
+            return "NOT_FOUND", False
+        return f"OK {value} version={version}", False
 
     def _handle_getv(
         self, argument_blob: str, show_version: bool = True

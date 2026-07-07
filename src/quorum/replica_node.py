@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Replica Node per il KV Store con Quorum e Session Consistency.
 

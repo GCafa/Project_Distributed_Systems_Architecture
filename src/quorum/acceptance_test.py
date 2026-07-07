@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Test di accettazione per Session Consistency (Homework 5).
 
@@ -293,18 +292,55 @@ def main() -> None:
 
         # =================================================================
         # T7: Quorum non raggiungibile
-        # Testiamo che se specifico repliche inesistenti nel coordinator,
-        # il quorum non viene raggiunto e si riceve un errore.
-        # (In questo test usiamo il coordinator gia' attivo: tutte le
-        #  repliche sono up, quindi il quorum e' sempre raggiungibile.
-        #  Questo test verifica solo il caso nominale positivo.)
+        # Avviamo un coordinator separato con repliche inesistenti per
+        # verificare che il quorum failure viene segnalato correttamente
+        # sia in lettura che in scrittura.
         # =================================================================
         print("-" * 60)
-        print("T7: Quorum check")
+        print("T7: Quorum non raggiungibile")
         print("-" * 60)
+
+        # Caso nominale positivo: il coordinator principale funziona
         expect("STATUS", "OK N=3 R=2 W=2", "T7")
-        # Verifichiamo che un GET su chiave inesistente restituisca NOT_FOUND
         expect("GETV nonexistent_key", "NOT_FOUND", "T7")
+
+        # Caso critico: coordinator con repliche irraggiungibili
+        unreachable_coord_port = 6452
+        unreachable_coord = subprocess.Popen(
+            [
+                sys.executable,
+                str(root / "coordinator.py"),
+                "--port", str(unreachable_coord_port),
+                "--read-quorum", "2",
+                "--write-quorum", "2",
+                "--replicas", "127.0.0.1:9990", "127.0.0.1:9991", "127.0.0.1:9992",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        processes.append(unreachable_coord)
+        wait_for_port(unreachable_coord_port)
+
+        # Lettura -> ERR read quorum not reached
+        read_resp = request_to("GETV any_key", unreachable_coord_port)
+        print(f"  [T7] GETV (repliche irraggiungibili) -> {read_resp}")
+        if read_resp.startswith("ERR read quorum not reached"):
+            print("  [T7] Read quorum failure correttamente segnalato [PASS]")
+            passed += 1
+        else:
+            print(f"  [T7] Expected 'ERR read quorum not reached' [FAIL]")
+            failed += 1
+
+        # Scrittura -> ERR write quorum not reached
+        write_resp = request_to("SET any_key any_value", unreachable_coord_port)
+        print(f"  [T7] SET (repliche irraggiungibili) -> {write_resp}")
+        if write_resp.startswith("ERR write quorum not reached"):
+            print("  [T7] Write quorum failure correttamente segnalato [PASS]")
+            passed += 1
+        else:
+            print(f"  [T7] Expected 'ERR write quorum not reached' [FAIL]")
+            failed += 1
+
         print()
 
         # =================================================================

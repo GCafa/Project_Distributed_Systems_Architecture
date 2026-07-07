@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Client interattivo con Session Consistency per il KV Store.
 
