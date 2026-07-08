@@ -167,7 +167,7 @@ def main() -> None:
             subprocess.Popen(
                 [
                     sys.executable,
-                    str(root / "coordinator.py"),
+                    str(root / "coordinator_stateless.py"),
                     "--port", str(COORDINATOR_PORT),
                     "--read-quorum", "2",
                     "--write-quorum", "2",
@@ -309,7 +309,7 @@ def main() -> None:
         unreachable_coord = subprocess.Popen(
             [
                 sys.executable,
-                str(root / "coordinator.py"),
+                str(root / "coordinator_stateless.py"),
                 "--port", str(unreachable_coord_port),
                 "--read-quorum", "2",
                 "--write-quorum", "2",
@@ -400,7 +400,7 @@ def main() -> None:
         stale_coord = subprocess.Popen(
             [
                 sys.executable,
-                str(root / "coordinator.py"),
+                str(root / "coordinator_stateless.py"),
                 "--port", str(stale_coord_port),
                 "--read-quorum", "1",
                 "--write-quorum", "1",

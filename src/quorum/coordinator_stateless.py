@@ -1,25 +1,31 @@
 """
-Coordinator con Quorum e Session Consistency (MIN_VERSION).
+Coordinator con Quorum, Session Consistency (MIN_VERSION) e Read Repair.
 
-ARCHITETTURA:
-  Il coordinator e' il punto d'ingresso per i client. Riceve comandi
-  testuali via TCP, li traduce in operazioni JSON sulle repliche,
-  raccoglie le risposte e applica la logica di quorum.
+Basato sul coordinator del laboratorio quorum_cluster, esteso con:
+  - GETV <key> [MIN_VERSION <v>]   lettura con garanzia di sessione
+  - GET <key> [MIN_VERSION <v>]    come GETV ma senza version= nella risposta
+  - CAS <key> <expected_ver> <val> compare-and-swap versionato
+  - Read Repair                    aggiorna in background le repliche stale
 
 PROTOCOLLO CLIENT -> COORDINATOR (testuale, una riga per comando):
   PING                              -> OK PONG
   STATUS                            -> OK N=3 R=2 W=2
   SET <key> <value>                 -> OK version=<v> acks=<n>
   GETV <key> [MIN_VERSION <v>]      -> OK <value> version=<v>
+  GET <key> [MIN_VERSION <v>]       -> OK <value>
   CAS <key> <expected_ver> <value>  -> OK version=<v> acks=<n>
   QUIT                              -> OK BYE
 
 SESSION CONSISTENCY (Homework 5):
-  MIN_VERSION e' un parametro opzionale per GETV.
+  MIN_VERSION e' un parametro opzionale per GETV e GET.
   Se specificato, il coordinator verifica che la versione migliore
-  trovata nel quorum sia >= MIN_VERSION. In caso contrario risponde:
-    ERR stale min_version=<v> best=<b>
-  Questo garantisce monotonic reads e read-your-writes lato client.
+  trovata nelle repliche sia >= MIN_VERSION. Strategia:
+    1. Legge dal quorum R
+    2. Se soddisfa il vincolo -> OK, read repair in background
+    3. Se no, legge dalle repliche rimanenti (fallback)
+    4. Se ancora non soddisfa -> ERR stale min_version=<v> best=<b>
+  Questo garantisce monotonic reads e read-your-writes lato client,
+  a patto che il client tracci le versioni e le invii correttamente.
 
 READ REPAIR:
   Quando il coordinator legge da piu' repliche e trova versioni
@@ -62,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     --write-quorum:    numero minimo di ACK per considerare la write riuscita (W)
     --replicas:        lista di endpoint replica nel formato host:port
     """
-    parser = argparse.ArgumentParser(description="Quorum coordinator per KV store")
+    parser = argparse.ArgumentParser(description="Quorum coordinator con session consistency")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=6420)
     parser.add_argument("--read-quorum", type=int, default=2)
@@ -76,7 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 class QuorumCoordinator:
     """
-    Coordinator centrale del KV store con quorum.
+    Coordinator centrale del KV store con quorum, session consistency e read repair.
 
     Responsabilita':
     - Ricevere comandi testuali dai client
@@ -100,9 +106,9 @@ class QuorumCoordinator:
             "PING": self._handle_ping,
             "STATUS": self._handle_status,
             "SET": self._handle_set,
-            "GET": self._handle_get,      # alias semplice (senza versione)
-            "GETV": self._handle_getv,     # lettura con versione + MIN_VERSION
-            "CAS": self._handle_cas,       # compare-and-swap
+            "GET": self._handle_get,
+            "GETV": self._handle_getv,
+            "CAS": self._handle_cas,
             "QUIT": self._handle_quit,
         }
 
@@ -114,7 +120,6 @@ class QuorumCoordinator:
         stripped = line.strip()
         if not stripped:
             return "ERR empty command", False
-        # Splitta al primo spazio: il primo token e' il comando
         command, *rest = stripped.split(" ", 1)
         command = command.upper()
         argument_blob = rest[0] if rest else ""
@@ -123,9 +128,9 @@ class QuorumCoordinator:
             return "ERR unknown command", False
         return handler(argument_blob)
 
-    # =========================================================================
+    # =====================================================================
     # RPC: comunicazione coordinator -> replica
-    # =========================================================================
+    # =====================================================================
 
     def _rpc(
         self, replica: ReplicaEndpoint, message: dict[str, object]
@@ -156,9 +161,9 @@ class QuorumCoordinator:
         except json.JSONDecodeError:
             return None
 
-    # =========================================================================
+    # =====================================================================
     # Logica di quorum per le letture
-    # =========================================================================
+    # =====================================================================
 
     def _collect_reads(
         self, key: str, limit: int | None = None
@@ -167,8 +172,11 @@ class QuorumCoordinator:
         Interroga le repliche per leggere una chiave.
 
         Restituisce una lista di (replica_endpoint, response_dict).
-        Se limit e' specificato, si ferma dopo aver raccolto limit risposte valide.
-        Se limit=None, interroga TUTTE le repliche (utile per read repair).
+        Tenere traccia della replica permette di fare read repair sulle
+        repliche stale.
+
+        Se limit e' specificato, si ferma dopo aver raccolto limit risposte.
+        Se limit=None, interroga TUTTE le repliche.
         """
         results: list[tuple[ReplicaEndpoint, dict[str, object]]] = []
         for replica in self._replicas:
@@ -178,6 +186,28 @@ class QuorumCoordinator:
             results.append((replica, response))
             if limit is not None and len(results) >= limit:
                 break
+        return results
+
+    def _collect_reads_remaining(
+        self,
+        key: str,
+        already_read: list[tuple[ReplicaEndpoint, dict[str, object]]],
+    ) -> list[tuple[ReplicaEndpoint, dict[str, object]]]:
+        """
+        Legge dalle repliche NON ancora interrogate.
+
+        Evita di interrogare due volte la stessa replica durante il
+        fallback o il read repair.
+        """
+        already_contacted = {replica for replica, _ in already_read}
+        results: list[tuple[ReplicaEndpoint, dict[str, object]]] = []
+        for replica in self._replicas:
+            if replica in already_contacted:
+                continue
+            response = self._rpc(replica, {"type": "read", "key": key})
+            if response is None or response.get("status") != "OK":
+                continue
+            results.append((replica, response))
         return results
 
     def _highest_version(
@@ -200,6 +230,10 @@ class QuorumCoordinator:
                 best_value = str(read.get("value", ""))
         return best_version, best_value
 
+    # =====================================================================
+    # Read Repair
+    # =====================================================================
+
     def _do_read_repair(
         self,
         key: str,
@@ -208,18 +242,22 @@ class QuorumCoordinator:
         reads: list[tuple[ReplicaEndpoint, dict[str, object]]],
     ) -> None:
         """
-        Read Repair: aggiorna le repliche che hanno una versione piu' vecchia.
+        Aggiorna le repliche stale con la versione piu' recente.
 
         Per ogni replica il cui valore letto ha version < best_version,
-        invia una write con il valore piu' recente. La replica accetta
-        solo se incoming_version >= current_version, quindi e' safe.
+        invia una write. La replica accetta solo se incoming_version >=
+        current_version, quindi e' safe: non sovrascrive mai un valore
+        piu' recente arrivato nel frattempo.
 
-        Eseguito in background (non blocca la risposta al client).
+        Eseguito in un thread separato per non bloccare la risposta al client.
         """
         for replica, read in reads:
             read_version = int(read.get("version", -1)) if read.get("found") else -1
             if read_version < best_version:
-                # Questa replica e' stale: invio la versione corretta
+                log(
+                    f"read repair: {replica.host}:{replica.port} "
+                    f"version={read_version} -> {best_version}"
+                )
                 self._rpc(
                     replica,
                     {
@@ -230,9 +268,67 @@ class QuorumCoordinator:
                     },
                 )
 
-    # =========================================================================
+    # =====================================================================
+    # Lettura session-aware (MIN_VERSION + fallback + read repair)
+    # =====================================================================
+
+    def _session_aware_read(
+        self, key: str, min_version: int | None
+    ) -> tuple[int, str | None, list[tuple[ReplicaEndpoint, dict[str, object]]]]:
+        """
+        Lettura con garanzia di sessione e read repair.
+
+        Strategia:
+        1. Legge dal quorum R
+        2. Se la versione migliore >= min_version -> OK
+           - legge le repliche rimanenti per read repair
+        3. Se no, legge dalle repliche rimanenti (fallback)
+        4. Se ancora non soddisfa -> la versione resta < min_version
+
+        Restituisce (version, value, all_reads).
+        """
+        # Passo 1: lettura quorum R
+        reads = self._collect_reads(key, limit=self._read_quorum)
+        version, value = self._highest_version(reads)
+
+        # Passo 2: vincolo soddisfatto o nessun vincolo
+        if min_version is None or version >= min_version:
+            if version >= 0 and value is not None:
+                # Legge le repliche rimanenti per read repair
+                remaining = self._collect_reads_remaining(key, reads)
+                all_reads = reads + remaining
+                # Controlla se una replica rimanente ha una versione migliore
+                all_version, all_value = self._highest_version(all_reads)
+                if all_version > version:
+                    version, value = all_version, all_value
+                # Read repair in background
+                threading.Thread(
+                    target=self._do_read_repair,
+                    args=(key, version, value, all_reads),
+                    daemon=True,
+                ).start()
+                return version, value, all_reads
+            return version, value, reads
+
+        # Passo 3: fallback — legge le repliche non ancora contattate
+        log(f"session fallback: version={version} < min_version={min_version} for key={key}")
+        remaining = self._collect_reads_remaining(key, reads)
+        all_reads = reads + remaining
+        version, value = self._highest_version(all_reads)
+
+        # Read repair anche in caso di fallback
+        if version >= 0 and value is not None:
+            threading.Thread(
+                target=self._do_read_repair,
+                args=(key, version, value, all_reads),
+                daemon=True,
+            ).start()
+
+        return version, value, all_reads
+
+    # =====================================================================
     # Handler dei comandi
-    # =========================================================================
+    # =====================================================================
 
     def _handle_ping(self, argument_blob: str) -> tuple[str, bool]:
         """PING -> OK PONG. Health check."""
@@ -253,7 +349,7 @@ class QuorumCoordinator:
         """
         SET <key> <value>
 
-        1. Legge la versione corrente da TUTTE le repliche (serve per assegnare next_version)
+        1. Legge la versione corrente da TUTTE le repliche
         2. Calcola next_version = max_version + 1
         3. Scrive su tutte le repliche con next_version
         4. Se almeno W repliche confermano (ACK), restituisce OK
@@ -285,42 +381,14 @@ class QuorumCoordinator:
 
         return f"ERR write quorum not reached acks={acknowledgements}", False
 
-    def _handle_get(self, argument_blob: str) -> tuple[str, bool]:
-        """
-        GET <key>
-
-        Lettura leggera: legge solo da R repliche (senza read repair).
-        Restituisce valore e versione. Non supporta MIN_VERSION.
-        """
-        key = argument_blob.strip()
-        if not key:
-            return "ERR usage: GET <key>", False
-
-        reads = self._collect_reads(key, limit=self._read_quorum)
-        if len(reads) < self._read_quorum:
-            return f"ERR read quorum not reached responses={len(reads)}", False
-
-        version, value = self._highest_version(reads)
-        if version < 0 or value is None:
-            return "NOT_FOUND", False
-        return f"OK {value} version={version}", False
-
-    def _handle_getv(
-        self, argument_blob: str, show_version: bool = True
-    ) -> tuple[str, bool]:
+    def _handle_getv(self, argument_blob: str) -> tuple[str, bool]:
         """
         GETV <key> [MIN_VERSION <v>]
 
-        Lettura con session consistency:
-        1. Parsa la chiave e l'eventuale MIN_VERSION
-        2. Legge da TUTTE le repliche (per poter fare read repair)
-        3. Verifica che ci siano almeno R risposte (quorum)
-        4. Trova la versione piu' alta
-        5. Se MIN_VERSION e' specificato e best < min -> ERR stale
-        6. Altrimenti restituisce il valore
-        7. Fa read repair in background sulle repliche stale
+        Lettura con session consistency e read repair.
+        Se MIN_VERSION e' specificato e la versione migliore e' inferiore,
+        restituisce ERR stale.
         """
-        # --- Parsing argomenti: "key [MIN_VERSION v]" ---
         tokens = argument_blob.strip().split()
         if not tokens:
             return "ERR usage: GETV <key> [MIN_VERSION <v>]", False
@@ -328,7 +396,6 @@ class QuorumCoordinator:
         key = tokens[0]
         min_version: int | None = None
 
-        # Cerco il parametro opzionale MIN_VERSION
         if len(tokens) == 3 and tokens[1].upper() == "MIN_VERSION":
             try:
                 min_version = int(tokens[2])
@@ -337,37 +404,51 @@ class QuorumCoordinator:
         elif len(tokens) != 1:
             return "ERR usage: GETV <key> [MIN_VERSION <v>]", False
 
-        # Leggo da TUTTE le repliche (non solo R) per fare read repair
-        reads = self._collect_reads(key, limit=None)
+        version, value, reads = self._session_aware_read(key, min_version)
 
-        # Verifico che il quorum di lettura sia raggiunto
         if len(reads) < self._read_quorum:
             return f"ERR read quorum not reached responses={len(reads)}", False
 
-        # Trovo la versione piu' alta
-        version, value = self._highest_version(reads)
         if version < 0 or value is None:
             return "NOT_FOUND", False
 
-        # === SESSION CONSISTENCY CHECK ===
-        # Se il client ha specificato MIN_VERSION e la migliore versione
-        # disponibile e' inferiore, rifiuto la lettura con errore esplicito.
-        # Questo garantisce monotonic reads e read-your-writes.
         if min_version is not None and version < min_version:
-            return (
-                f"ERR stale min_version={min_version} best={version}",
-                False,
-            )
+            return f"ERR stale min_version={min_version} best={version}", False
 
-        # Read repair in background: aggiorno le repliche stale
-        threading.Thread(
-            target=self._do_read_repair,
-            args=(key, version, value, reads),
-            daemon=True,
-        ).start()
+        return f"OK {value} version={version}", False
 
-        if show_version:
-            return f"OK {value} version={version}", False
+    def _handle_get(self, argument_blob: str) -> tuple[str, bool]:
+        """
+        GET <key> [MIN_VERSION <v>]
+
+        Come GETV ma senza version= nella risposta di successo.
+        """
+        tokens = argument_blob.strip().split()
+        if not tokens:
+            return "ERR usage: GET <key> [MIN_VERSION <v>]", False
+
+        key = tokens[0]
+        min_version: int | None = None
+
+        if len(tokens) == 3 and tokens[1].upper() == "MIN_VERSION":
+            try:
+                min_version = int(tokens[2])
+            except ValueError:
+                return "ERR MIN_VERSION must be an integer", False
+        elif len(tokens) != 1:
+            return "ERR usage: GET <key> [MIN_VERSION <v>]", False
+
+        version, value, reads = self._session_aware_read(key, min_version)
+
+        if len(reads) < self._read_quorum:
+            return f"ERR read quorum not reached responses={len(reads)}", False
+
+        if version < 0 or value is None:
+            return "NOT_FOUND", False
+
+        if min_version is not None and version < min_version:
+            return f"ERR stale min_version={min_version} best={version}", False
+
         return f"OK {value}", False
 
     def _handle_cas(self, argument_blob: str) -> tuple[str, bool]:
@@ -376,9 +457,12 @@ class QuorumCoordinator:
 
         Compare-And-Swap:
         1. Legge da tutte le repliche per trovare la versione corrente
-        2. Verifica che la versione corrente == expected_version
-        3. Se si, scrive new_value con version = expected + 1
-        4. Se no, restituisce ERR version_mismatch
+        2. Verifica che current_version == expected_version
+        3. Scrive new_value con version = expected + 1
+        4. Richiede almeno W ACK
+
+        Usa "type": "write" verso le repliche (la replica accetta
+        solo se incoming_version >= current_version).
         """
         parts = argument_blob.strip().split(" ", 2)
         if len(parts) != 3:
@@ -392,30 +476,28 @@ class QuorumCoordinator:
         new_value = parts[2]
 
         # Leggo da tutte le repliche per trovare la versione corrente
-        reads = self._collect_reads(key, limit=None)
+        reads = self._collect_reads(key)
         if len(reads) < self._read_quorum:
             return f"ERR read quorum not reached responses={len(reads)}", False
 
         current_version, _ = self._highest_version(reads)
 
-        # Verifico che la versione corrente corrisponda a quella attesa
         if current_version < 0:
             return "ERR not_found", False
         if current_version != expected_version:
             return f"ERR version_mismatch current={current_version}", False
 
-        # Versione corretta: eseguo la CAS su tutte le repliche
+        # Scrive la nuova versione su tutte le repliche
         new_version = expected_version + 1
         acknowledgements = 0
         for replica in self._replicas:
             response = self._rpc(
                 replica,
                 {
-                    "type": "cas",
+                    "type": "write",
                     "key": key,
-                    "expected_version": expected_version,
-                    "new_value": new_value,
-                    "new_version": new_version,
+                    "value": new_value,
+                    "version": new_version,
                 },
             )
             if response is not None and response.get("status") == "ACK":
@@ -434,6 +516,10 @@ class QuorumCoordinator:
             return "ERR usage: QUIT", False
         return "OK BYE", True
 
+
+# =====================================================================
+# Server TCP
+# =====================================================================
 
 def handle_client(
     connection: socket.socket,
@@ -483,7 +569,7 @@ def serve() -> None:
         server_socket.bind((args.host, args.port))
         server_socket.listen()
         log(
-            f"quorum coordinator listening on {args.host}:{args.port} "
+            f"session coordinator listening on {args.host}:{args.port} "
             f"N={len(replicas)} R={args.read_quorum} W={args.write_quorum}"
         )
 
