@@ -35,6 +35,7 @@ from pathlib import Path
 # === CONFIGURAZIONE ===
 HOST = "127.0.0.1"
 COORDINATOR_PORT = 6420
+REQUEST_TIMEOUT = 10.0
 REPLICAS = [
     ("R0", 6421),
     ("R1", 6422),
@@ -66,7 +67,7 @@ def request(command: str, port: int = COORDINATOR_PORT) -> str:
     Invia un singolo comando testuale al coordinator e restituisce la risposta.
     Ogni chiamata apre una nuova connessione TCP (stateless).
     """
-    with socket.create_connection((HOST, port), timeout=2.0) as connection:
+    with socket.create_connection((HOST, port), timeout=REQUEST_TIMEOUT) as connection:
         connection_file = connection.makefile("rwb")
         connection_file.write((command + "\n").encode("utf-8"))
         connection_file.flush()
@@ -167,7 +168,7 @@ def main() -> None:
             subprocess.Popen(
                 [
                     sys.executable,
-                    str(root / "coordinator_stateless.py"),
+                        str(root / "coordinator.py"),
                     "--port", str(COORDINATOR_PORT),
                     "--read-quorum", "2",
                     "--write-quorum", "2",
@@ -309,7 +310,7 @@ def main() -> None:
         unreachable_coord = subprocess.Popen(
             [
                 sys.executable,
-                str(root / "coordinator_stateless.py"),
+                str(root / "coordinator.py"),
                 "--port", str(unreachable_coord_port),
                 "--read-quorum", "2",
                 "--write-quorum", "2",
@@ -400,7 +401,7 @@ def main() -> None:
         stale_coord = subprocess.Popen(
             [
                 sys.executable,
-                str(root / "coordinator_stateless.py"),
+                str(root / "coordinator.py"),
                 "--port", str(stale_coord_port),
                 "--read-quorum", "1",
                 "--write-quorum", "1",

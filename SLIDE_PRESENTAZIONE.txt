@@ -196,7 +196,7 @@ SLIDE 8 — IMPLEMENTAZIONE STATELESS: IL COORDINATOR
 ================================================================================
 
 [CONTENUTO SLIDE]
-• Classe: QuorumCoordinator (coordinator_stateless.py)
+• Classe: QuorumCoordinator (src/quorum/stateless/coordinator.py)
 • Flusso di una lettura GETV con MIN_VERSION:
   1. Legge dal quorum R (2 repliche)
   2. Trova la versione migliore (best_version)
@@ -221,7 +221,7 @@ SLIDE 9 — IMPLEMENTAZIONE STATEFUL: IL COORDINATOR
 ================================================================================
 
 [CONTENUTO SLIDE]
-• Classe: StatefulQuorumCoordinator (coordinator_stateful.py)
+• Classe: StatefulQuorumCoordinator (src/quorum/stateful/coordinator.py)
 • Struttura aggiuntiva: _sessions: dict[str, SessionState]
   — SessionState.last_seen: dict[str, int] → key → max version
   — SessionState.last_access: float → timestamp ultimo accesso
@@ -388,8 +388,8 @@ SLIDE 15 — I TEST: PANORAMICA E APPROCCIO
 
 [CONTENUTO SLIDE]
 • Due suite di test:
-  — acceptance_test.py → testa il coordinator STATELESS (9 test)
-  — acceptance_test_stateful.py → testa il coordinator STATEFUL (9 test)
+  — stateless/acceptance_test.py → testa il coordinator STATELESS (9 test)
+  — stateful/acceptance_test.py → testa il coordinator STATEFUL (9 test)
 • Approccio automatizzato:
   1. Avvia 3 repliche + 1 coordinator automaticamente
   2. Esegue test nominali e critici
