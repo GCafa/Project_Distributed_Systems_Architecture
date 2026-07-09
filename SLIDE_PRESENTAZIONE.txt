@@ -1,0 +1,539 @@
+================================================================================
+                   SLIDE PER PRESENTAZIONE — HOMEWORK 5
+              Session Consistency Per Client (KV Store con Quorum)
+================================================================================
+
+
+================================================================================
+SLIDE 1 — TITOLO
+================================================================================
+
+[CONTENUTO SLIDE]
+• Titolo: Session Consistency Per Client
+• Sottotitolo: Homework 5 — Architettura dei Sistemi Distribuiti
+• Nomi del gruppo
+• Anno Accademico
+
+[COSA DIRE]
+"Buongiorno, presentiamo il nostro progetto per l'Homework 5.
+L'obiettivo è estendere un KV store distribuito con quorum
+aggiungendo una garanzia di consistenza di sessione.
+Un client che ha scritto o letto una certa versione non deve mai
+osservare, nella stessa sessione, una versione più vecchia."
+
+
+================================================================================
+SLIDE 2 — IL PROBLEMA: PERCHÉ SERVE SESSION CONSISTENCY
+================================================================================
+
+[CONTENUTO SLIDE]
+• In un sistema replicato, le repliche possono avere versioni diverse
+• Senza garanzie:
+  — Un client scrive V=3 → legge da replica stale → vede V=0
+  — "Effetto back-in-time": aggiorno un dato, lo rileggo, ed è tornato
+    al valore vecchio
+• Session consistency elimina queste anomalie
+• Più debole della linearizzabilità, ma molto pratica nei sistemi reali
+
+[COSA DIRE]
+"In un sistema distribuito con repliche, dopo una scrittura il dato
+potrebbe non essere ancora propagato a tutte le repliche. Se il
+client rilegge dalla replica sbagliata, vede un dato vecchio.
+La session consistency risolve questo: garantisce che nella stessa
+sessione il client non veda mai una versione precedente a quella
+che ha già osservato. È una garanzia più debole della linearizzabilità
+— non ordiniamo le operazioni tra client diversi — ma è sufficiente
+per eliminare le anomalie più confuse per l'utente finale."
+
+
+================================================================================
+SLIDE 3 — ARCHITETTURA GENERALE DEL SISTEMA
+================================================================================
+
+[CONTENUTO SLIDE]
+• 3 componenti:
+  1. Client — invia comandi testuali via TCP
+  2. Coordinator — nodo centrale, gestisce quorum e logica di sessione
+  3. Repliche (N=3) — KV store in memoria, comunicano via JSON/TCP
+• Parametri del quorum:
+  — N=3 (numero repliche), R=2 (read quorum), W=2 (write quorum)
+  — R + W > N → intersezione garantita tra letture e scritture
+• [Schema visivo: Client → Coordinator → R0, R1, R2]
+
+[COSA DIRE]
+"L'architettura è composta da tre livelli. Il client si connette
+al coordinator via TCP con un protocollo testuale semplice.
+Il coordinator traduce i comandi in RPC JSON verso le repliche.
+Le repliche sono server TCP che mantengono in memoria un dizionario
+chiave → {valore, versione}.
+Usiamo N=3 repliche con R=2 e W=2: poiché R+W=4 > N=3, c'è sempre
+almeno una replica che ha partecipato sia alla scrittura più recente
+che alla lettura corrente. Questo è il fondamento del quorum."
+
+
+================================================================================
+SLIDE 4 — COMANDI DEL CONTRATTO PUBBLICO
+================================================================================
+
+[CONTENUTO SLIDE]
+• SET <key> <value>
+  — Scrive con versione monotona crescente (max_corrente + 1)
+  — Risposta: OK version=<v> acks=<n>
+• GETV <key> [MIN_VERSION <v>]
+  — Lettura con garanzia di sessione + read repair
+  — Risposta: OK <value> version=<v>
+• CAS <key> <expected_version> <new_value>
+  — Compare-And-Swap atomico: scrive solo se version == expected
+  — Risposta: OK version=<v> acks=<n> oppure ERR version_mismatch
+• GET, PING, STATUS, QUIT — comandi ausiliari
+
+[COSA DIRE]
+"Il contratto pubblico definisce i comandi disponibili. SET scrive
+un valore con versione automatica calcolata come max_corrente + 1.
+GETV è il comando chiave: legge dal quorum e supporta MIN_VERSION,
+che è il parametro che abilita la session consistency.
+CAS è un compare-and-swap: scrive solo se la versione corrente
+corrisponde a quella attesa. È utile per aggiornamenti ottimistici
+senza lock.
+Ogni comando ha precondizioni, postcondizioni e risposte di errore
+esplicite documentate nel contratto."
+
+
+================================================================================
+SLIDE 5 — IL CUORE: STATELESS vs STATEFUL — DUE STRATEGIE
+================================================================================
+
+[CONTENUTO SLIDE]
+• Due approcci implementati:
+
+  STATELESS (MIN_VERSION):
+  — Il client traccia localmente: session[key] = last_seen_version
+  — Ad ogni GETV invia: GETV <key> MIN_VERSION <v>
+  — Il server è completamente senza stato di sessione
+  — Sintassi: GETV key MIN_VERSION 3
+
+  STATEFUL (SESSION):
+  — Il coordinator mantiene: sessions[client_id][key] = version
+  — Il client aggiunge: SESSION <client_id> ad ogni comando
+  — Il server traccia tutto internamente
+  — Sintassi: GETV key SESSION clientA
+
+[COSA DIRE]
+"Abbiamo implementato entrambe le strategie suggerite dall'homework.
+Nell'approccio stateless, il client è responsabile di tracciare le
+versioni e di inviarle al coordinator come MIN_VERSION. Il server
+non mantiene nessuna informazione sulle sessioni.
+Nell'approccio stateful, il coordinator mantiene una tabella
+session[client_id][key] = version. Il client invia solo il suo
+identificativo e il server fa tutto automaticamente."
+
+
+================================================================================
+SLIDE 6 — CONFRONTO STATELESS vs STATEFUL: TRADE-OFF
+================================================================================
+
+[CONTENUTO SLIDE]
+Tabella comparativa:
+
+| Aspetto            | Stateless (MIN_VERSION)          | Stateful (SESSION)                |
+|--------------------|----------------------------------|-----------------------------------|
+| Stato sul server   | Nessuno                          | Tabella client_id → {key → ver}   |
+| Scalabilità        | Ottima (niente da replicare)     | Limitata (stato cresce coi client)|
+| Crash del client   | Perde sessione (accettabile)     | Server tiene stato orfano         |
+| Crash del server   | Il client ha tutto, riprende     | Stato perso, sessioni resettate   |
+| Complessità client | Deve tracciare le versioni       | Semplice (invia solo client_id)   |
+| Garbage collection | Non necessaria                   | Serve un GC per sessioni orfane   |
+| Banda di rete      | MIN_VERSION in ogni richiesta    | Solo client_id in ogni richiesta  |
+
+[COSA DIRE]
+"Questa tabella riassume i trade-off fondamentali. La versione stateless
+scala meglio perché il server non mantiene stato: puoi avere 10.000
+client senza consumare memoria sul coordinator. Se il client crolla e
+riavvia, perde la sessione, ma questo è esattamente ciò che ci si
+aspetta: la sessione è legata al ciclo di vita del client.
+Lo stateful è più comodo per il client, che non deve tracciare nulla,
+ma il server accumula stato. Abbiamo dovuto implementare un garbage
+collector che ogni 60 secondi rimuove le sessioni inattive da più di
+5 minuti, altrimenti la memoria cresce senza limiti."
+
+
+================================================================================
+SLIDE 7 — QUANDO USARE STATELESS, QUANDO STATEFUL
+================================================================================
+
+[CONTENUTO SLIDE]
+• Usare STATELESS quando:
+  — Tanti client contemporanei (scalabilità)
+  — Client che possono riavviarsi spesso (microservizi, serverless)
+  — Il server deve restare semplice e stateless
+  — Si vuole evitare garbage collection lato server
+  — Il client ha risorse per tracciare le versioni
+
+• Usare STATEFUL quando:
+  — Client leggeri o con capacità limitate (IoT, browser semplici)
+  — Pochi client con sessioni lunghe
+  — Si vuole un'API più semplice lato client
+  — Il coordinator è un singolo nodo con memoria sufficiente
+
+• La nostra scelta: STATELESS come approccio primario
+  — Il server resta scalabile e senza stato
+  — Il costo è un client leggermente più complesso
+
+[COSA DIRE]
+"Quando scegliere uno o l'altro? Lo stateless è la scelta migliore
+per sistemi con molti client, perché il server non accumula stato.
+È anche più robusto: se il server crolla e riavvia, non perde
+nessuna sessione perché le sessioni vivono sui client.
+Lo stateful è migliore quando i client sono dispositivi leggeri
+che non possono mantenere stato, come sensori IoT. In quel caso
+conviene centralizzare la logica sul coordinator.
+Noi abbiamo scelto lo stateless come approccio primario, ma abbiamo
+implementato anche lo stateful per dimostrare le differenze."
+
+
+================================================================================
+SLIDE 8 — IMPLEMENTAZIONE STATELESS: IL COORDINATOR
+================================================================================
+
+[CONTENUTO SLIDE]
+• Classe: QuorumCoordinator (coordinator_stateless.py)
+• Flusso di una lettura GETV con MIN_VERSION:
+  1. Legge dal quorum R (2 repliche)
+  2. Trova la versione migliore (best_version)
+  3. Se best_version >= MIN_VERSION → OK, avvia read repair
+  4. Se no → fallback: legge le repliche rimanenti
+  5. Se ancora no → ERR stale min_version=<v> best=<b>
+• Nessuna struttura di sessione sul server
+• Il vincolo viene interamente dal parametro MIN_VERSION del client
+
+[COSA DIRE]
+"Nel coordinator stateless, la funzione _session_aware_read implementa
+la logica. Prima legge dal quorum R, cioè 2 repliche. Se la versione
+migliore soddisfa MIN_VERSION, risponde OK e avvia il read repair in
+background. Se non la soddisfa, fa un fallback: interroga anche le
+repliche non ancora contattate. Se ancora nessuna soddisfa, restituisce
+un errore esplicito. Notate: il server non ha nessuna struttura dati
+per le sessioni. Il vincolo arriva interamente dal client."
+
+
+================================================================================
+SLIDE 9 — IMPLEMENTAZIONE STATEFUL: IL COORDINATOR
+================================================================================
+
+[CONTENUTO SLIDE]
+• Classe: StatefulQuorumCoordinator (coordinator_stateful.py)
+• Struttura aggiuntiva: _sessions: dict[str, SessionState]
+  — SessionState.last_seen: dict[str, int] → key → max version
+  — SessionState.last_access: float → timestamp ultimo accesso
+• Flusso di una GETV con SESSION:
+  1. Recupera sessione: _get_session(client_id) → crea se non esiste
+  2. min_version = session.min_version_for(key)
+  3. Stessa logica di lettura session-aware
+  4. Dopo lettura riuscita: session.update(key, version)
+• Garbage Collection: thread daemon che ogni 60s rimuove sessioni
+  inattive da più di 300 secondi
+• Lock threading per accesso concorrente alle sessioni
+
+[COSA DIRE]
+"Il coordinator stateful aggiunge una mappa sessions: per ogni
+client_id, traccia un SessionState che contiene le versioni massime
+osservate per ogni chiave. Quando il client invia SESSION clientA,
+il coordinator recupera la sessione, determina automaticamente
+la MIN_VERSION dalla storia del client, e poi applica la stessa
+logica di lettura. Dopo ogni operazione riuscita, aggiorna la sessione.
+Abbiamo anche un thread di garbage collection che rimuove le
+sessioni inattive, perché altrimenti la memoria crescerebbe senza limiti.
+Usiamo un threading.Lock per proteggere l'accesso concorrente."
+
+
+================================================================================
+SLIDE 10 — IL CLIENT: DUE MODALITÀ
+================================================================================
+
+[CONTENUTO SLIDE]
+• File: client.py — un unico client con flag --mode stateless|stateful
+• Modalità STATELESS:
+  — Mantiene localmente: session[key] = last_seen_version
+  — Iniezione automatica: GETV key → GETV key MIN_VERSION <v>
+  — Aggiornamento: session[key] = max(session[key], version_ricevuta)
+  — Comandi locali: SESSION (visualizza), RESET_SESSION (resetta)
+• Modalità STATEFUL:
+  — Appende SESSION <client_id> a ogni SET, GETV, GET, CAS
+  — Non traccia versioni localmente
+  — Più semplice ma dipende dal coordinator
+• Entrambe trasparenti: l'utente scrive gli stessi comandi
+
+[COSA DIRE]
+"Il client è un unico programma che si avvia con --mode stateless
+o --mode stateful. In modalità stateless, inietta automaticamente
+MIN_VERSION nelle GETV usando la mappa di sessione locale. L'utente
+scrive semplicemente GETV key e il client aggiunge MIN_VERSION 3
+trasparentemente. L'aggiornamento usa max() per garantire monotonic
+reads: non torniamo mai a una versione precedente.
+In modalità stateful, il client appende SESSION clientA a ogni
+comando e non traccia nulla localmente."
+
+
+================================================================================
+SLIDE 11 — LA REPLICA: VERSIONING E PROTEZIONE
+================================================================================
+
+[CONTENUTO SLIDE]
+• File: replica_node.py
+• Dizionario in memoria: _data[key] = {"value": str, "version": int}
+• Protocollo JSON su TCP:
+  — read: restituisce valore + versione (o found=False)
+  — write: accetta solo se incoming_version >= current_version
+  — cas: scrive solo se current_version == expected_version
+  — status: lista chiavi memorizzate (debug)
+• Protezione versioni: la write condizionata impedisce al read repair
+  di sovrascrivere dati più recenti
+• Concorrenza: threading.Lock protegge _data
+
+[COSA DIRE]
+"Ogni replica è semplice: un dizionario in memoria con un lock.
+La cosa importante è la write condizionata: una replica accetta una
+scrittura solo se la versione in arrivo è >= a quella corrente.
+Questo è fondamentale per il read repair: se nel frattempo un'altra
+scrittura ha aggiornato la replica, il read repair non la sovrascrive.
+È un doppio controllo: il coordinator invia il read repair solo alle
+repliche stale, e la replica accetta solo se la versione è valida."
+
+
+================================================================================
+SLIDE 12 — READ REPAIR: CONVERGENZA IN BACKGROUND
+================================================================================
+
+[CONTENUTO SLIDE]
+• Dopo ogni lettura GETV riuscita, il coordinator:
+  1. Legge da TUTTE le repliche (non solo il quorum R)
+  2. Identifica la versione migliore (best_version)
+  3. Per ogni replica con version < best_version → invia write
+• Eseguito in un thread separato (daemon) → non rallenta la risposta
+• Doppio controllo:
+  — Coordinator: invia solo a repliche con version < best
+  — Replica: accetta solo se incoming_version >= current
+
+[COSA DIRE]
+"Il read repair è il meccanismo che fa convergere le repliche.
+Dopo aver risposto al client, il coordinator legge tutte le repliche
+e invia la versione migliore a quelle che sono indietro. Lo fa in
+un thread separato, quindi non aggiunge latenza alla risposta del client.
+Il doppio controllo — lato coordinator e lato replica — garantisce
+che non si sovrascrivano mai dati più recenti. Questo è particolarmente
+importante in scenari di concorrenza."
+
+
+================================================================================
+SLIDE 13 — PROPRIETÀ DI SAFETY
+================================================================================
+
+[CONTENUTO SLIDE]
+• S1: Read-Your-Writes (per singolo client)
+  — Se scrivi version=V, la lettura successiva non restituirà mai V-1
+  — Garantito da: MIN_VERSION (stateless) o sessione server (stateful)
+  — Se non soddisfatto → ERR stale (mai dati vecchi silenziosamente)
+
+• S2: Monotonic Reads (per singolo client)
+  — Se leggi version=V1, la lettura successiva non restituirà V2 < V1
+  — Garantito da: session[key] = max(current, received_version)
+
+• S3: Read Repair sicuro
+  — Il read repair non sovrascrive mai versioni più nuove
+  — Doppio controllo: coordinator + replica
+
+[COSA DIRE]
+"Le proprietà di safety sono tre. Read-your-writes: se scrivo un dato,
+non lo vedrò mai tornare indietro. Monotonic reads: se leggo la
+versione 5, non leggerò mai la versione 3 dopo. Entrambe sono
+garantite dal meccanismo di MIN_VERSION nel caso stateless, o dalla
+sessione lato server nel caso stateful.
+La terza proprietà riguarda il read repair: non sovrascrive mai
+dati più recenti grazie al doppio controllo su coordinator e replica."
+
+
+================================================================================
+SLIDE 14 — PROPRIETÀ DI LIVENESS
+================================================================================
+
+[CONTENUTO SLIDE]
+• L1: Progresso garantito se il quorum è raggiungibile
+  — Se almeno R repliche (lettura) o W repliche (scrittura) rispondono
+    entro il timeout di 1s → l'operazione completa
+  — Repliche irraggiungibili: semplicemente saltate
+
+• L2: Fallimento dichiarato (no blocco silenzioso)
+  — Se MIN_VERSION non è soddisfacibile → ERR stale (risposta immediata)
+  — Nessun polling, nessun timeout nascosto
+  — Il client decide: riprovare, resettare sessione, o notificare utente
+
+• L3: Nessuna memoria illimitata sul server (stateless)
+  — Sessione interamente lato client → zero stato server
+  — Stateful: garbage collection ogni 60s, timeout 5 min
+
+[COSA DIRE]
+"Per la liveness, la proprietà L1 dice che se il quorum è raggiungibile,
+l'operazione completerà. L2 è molto importante: se la versione minima
+non è soddisfacibile, il sistema risponde immediatamente con ERR stale.
+Non si blocca mai aspettando che una replica si aggiorni. Questa è una
+scelta di design: preferiamo un errore esplicito a un blocco silenzioso.
+L3 riguarda la memoria: nello stateless il server non usa memoria per
+le sessioni. Nello stateful, il garbage collector impedisce la crescita
+illimitata."
+
+
+================================================================================
+SLIDE 15 — I TEST: PANORAMICA E APPROCCIO
+================================================================================
+
+[CONTENUTO SLIDE]
+• Due suite di test:
+  — acceptance_test.py → testa il coordinator STATELESS (9 test)
+  — acceptance_test_stateful.py → testa il coordinator STATEFUL (9 test)
+• Approccio automatizzato:
+  1. Avvia 3 repliche + 1 coordinator automaticamente
+  2. Esegue test nominali e critici
+  3. Spegne tutto alla fine
+• Manipolazione diretta delle repliche via JSON per simulare guasti
+• Coordinator secondari per isolare scenari specifici
+
+[COSA DIRE]
+"Abbiamo due suite di test completamente automatizzate, una per ogni
+approccio. Ogni test avvia l'intero cluster, esegue gli scenari e
+spegne tutto. Per i test critici, manipoliamo direttamente le repliche
+via JSON bypassando il coordinator, così possiamo simulare repliche
+stale o irraggiungibili."
+
+
+================================================================================
+SLIDE 16 — TEST CHIAVE: T9 — LETTURA STALE CON E SENZA GARANZIA
+================================================================================
+
+[CONTENUTO SLIDE]
+• T9 (stateless) — il test più importante del progetto:
+  1. SET theta base_value → tutte le repliche: v=0
+  2. Forzo R0 a version=3 direttamente (R1, R2 restano a v=0)
+  3. Avvio un coordinator secondario con R=1 che punta SOLO a R1
+  4. GETV theta (SENZA MIN_VERSION) → OK base_value version=0 ← STALE!
+  5. GETV theta MIN_VERSION 3 → ERR stale min_version=3 best=0 ← PROTETTO!
+• Dimostra: senza session consistency il client legge dati vecchi
+• Con MIN_VERSION il sistema rifiuta esplicitamente
+
+[COSA DIRE]
+"Questo è il test più importante perché dimostra concretamente il
+problema e la soluzione. Creiamo una situazione dove una replica è
+avanti (v=3) e le altre sono indietro (v=0). Usiamo un coordinator
+isolato che punta solo alla replica stale. Senza MIN_VERSION, il
+client riceve tranquillamente il dato vecchio senza sapere che è stale.
+Con MIN_VERSION=3, il sistema rifiuta e dice: 'la migliore versione
+che ho trovato è 0, ma tu hai chiesto almeno 3'. Questo è il cuore
+della session consistency."
+
+
+================================================================================
+SLIDE 17 — TEST CHIAVE: TS9 — SESSIONI INDIPENDENTI (STATEFUL)
+================================================================================
+
+[CONTENUTO SLIDE]
+• TS9 (stateful) — sessioni indipendenti:
+  — clientA e clientB operano sulle stesse chiavi
+  — Le sessioni non interferiscono tra loro
+  — Ogni sessione traccia le proprie versioni
+• Flusso:
+  1. clientA scrive e legge iota → sessione_A[iota] = 0
+  2. clientB legge iota → sessione_B[iota] = 0
+  3. clientA aggiorna iota a v=1 → sessione_A[iota] = 1
+  4. clientA legge iota → protetto: ≥ 1 ✓
+  5. clientB legge iota → protetto: ≥ 0 (sessione B) ✓
+• Verifica: STATUS mostra sessions >= 2
+
+[COSA DIRE]
+"Nel test stateful TS9, verifichiamo che le sessioni di client diversi
+siano completamente indipendenti. clientA ha una sessione con iota=1,
+clientB ha una sessione con iota=0. Le letture di ciascuno sono
+protette dalla propria sessione. Verifichiamo anche che il coordinator
+tenga traccia del numero di sessioni attive nel comando STATUS."
+
+
+================================================================================
+SLIDE 18 — TRADE-OFF E SCELTE DI DESIGN
+================================================================================
+
+[CONTENUTO SLIDE]
+• Errore esplicito vs Attesa
+  — Scelta: ERR stale immediato (no blocking, no polling)
+  — Motivazione: il client controlla la politica di retry
+
+• Read Repair in background vs sincrono
+  — Scelta: thread separato (non rallenta la risposta)
+  — Trade-off: ritardo nella convergenza delle repliche
+
+• Versioni monotone dal coordinator
+  — Scelta: max_corrente + 1 (ordinamento totale semplice)
+  — Limite: single point of assignment
+
+• Session consistency per singola chiave (non cross-key)
+  — Non garantiamo causalità tra chiavi diverse
+
+[COSA DIRE]
+"Voglio sottolineare le scelte di design principali. Quando MIN_VERSION
+non è soddisfacibile, il sistema non si blocca: restituisce un errore
+immediato. Questo è più debuggabile e il client ha il controllo completo.
+Il read repair è in background perché non vogliamo aggiungere latenza:
+il client riceve la risposta subito, e le repliche convergono dopo.
+Le versioni sono assegnate dal coordinator come max+1, il che crea un
+single point of assignment. Con più coordinator servirebbe un timestamp
+logico."
+
+
+================================================================================
+SLIDE 19 — LIMITI E POSSIBILI EVOLUZIONI
+================================================================================
+
+[CONTENUTO SLIDE]
+Limiti:
+  • Single coordinator → single point of failure
+  • Nessuna persistenza (dati in memoria)
+  • Connessione TCP per operazione (no connection pool)
+  • Session consistency solo per singola chiave (non cross-key)
+
+Evoluzioni possibili:
+  • Session consistency cross-key (vettore di versioni globale)
+  • Retry automatico con backoff esponenziale dopo ERR stale
+  • Persistent storage con Write-Ahead Log (WAL)
+  • Connection pooling verso le repliche
+  • Anti-entropy background (confronto periodico repliche)
+
+[COSA DIRE]
+"Il sistema ha dei limiti noti. Il coordinator è un single point of
+failure: se crolla, il sistema è indisponibile. I dati sono in memoria,
+quindi un crash della replica li perde. La consistenza è per singola
+chiave: non garantiamo che se scrivo A=1 e B=2, un altro client
+veda entrambi aggiornati atomicamente.
+Come evoluzioni, si potrebbe aggiungere un vettore di versioni globale
+per la causalità cross-key, o un WAL per la persistenza su disco."
+
+
+================================================================================
+SLIDE 20 — LA DOMANDA FINALE
+================================================================================
+
+[CONTENUTO SLIDE]
+• "Quale promessa nuova introduce il vostro sistema e quale costo
+  tecnico avete accettato per mantenerla?"
+• Promessa: Session Consistency
+  — Read-your-writes e monotonic reads per singolo client
+• Costo stateless: client più complesso (deve tracciare le versioni)
+• Costo stateful: server con stato (memoria, GC, complessità)
+• In entrambi i casi: il read repair aggiunge convergenza,
+  il fallimento è sempre esplicito, mai silenzioso
+
+[COSA DIRE]
+"Per concludere, la domanda chiave dell'homework: quale promessa e
+quale costo. La promessa è la session consistency: un client non vedrà
+mai un dato tornare indietro nella stessa sessione. Il costo dipende
+dall'approccio scelto: nello stateless paghi in complessità del client,
+nello stateful paghi in stato sul server. In entrambi i casi, il sistema
+è progettato per fallire in modo esplicito — mai silenziosamente —
+e il read repair garantisce la convergenza eventuale delle repliche.
+Grazie."
