@@ -18,6 +18,12 @@ di versione minima per quel client.
 Da questa cartella:
 
 ```bash
+python main.py
 python acceptance_test.py
 python client.py --port 6430 --client-id clientA
 ```
+
+`main.py` avvia automaticamente 3 repliche, il coordinator e poi il client
+interattivo. Il client continua a ricevere comandi finche' non inserisci
+`QUIT` o interrompi il programma. Puoi cambiare sessione con
+`python main.py --client-id altroClient`.

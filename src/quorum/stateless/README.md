@@ -18,6 +18,11 @@ stato di sessione.
 Da questa cartella:
 
 ```bash
+python main.py
 python acceptance_test.py
 python client.py --port 6420
 ```
+
+`main.py` avvia automaticamente 3 repliche, il coordinator e poi il client
+interattivo. Il client continua a ricevere comandi finche' non inserisci
+`QUIT` o interrompi il programma.
